@@ -726,10 +726,178 @@ def getNTLMSSPType3(type1, type2, user, password, domain, lmhash = '', nthash = 
     if version is not None:
         ntlmChallengeResponse['Version'] = version
     ntlmChallengeResponse['ntlm'] = ntResponse
-    if encryptedRandomSessionKey is not None: 
+    if encryptedRandomSessionKey is not None:
         ntlmChallengeResponse['session_key'] = encryptedRandomSessionKey
 
     return ntlmChallengeResponse, exportedSessionKey
+
+
+def getNTLMSSPType2(type1=None, challenge=None, targetName='', targetInfo=None,
+                    signingRequired=False, use_ntlmv2=USE_NTLMv2, version=None, flags=None):
+    """Build an NTLMSSP CHALLENGE_MESSAGE (Type 2) -- the acceptor/server-side
+    counterpart to getNTLMSSPType1().  See [MS-NLMP] 2.2.1.2.
+
+    :param type1: the NEGOTIATE_MESSAGE received from the client, either as an
+        ``NTLMAuthNegotiate`` or its raw bytes.  When supplied, the flags the server
+        advertises are masked down to those the client offered (a server never
+        negotiates up a capability the client did not request).  May be ``None``.
+    :param challenge: the 8-byte server challenge.  A random one is generated when
+        omitted.
+    :param targetName: the server/target name placed in the TargetName field
+        (encoded UTF-16LE).
+    :param targetInfo: the TargetInfo AV pairs, as an ``AV_PAIRS`` instance or raw
+        bytes.  When ``use_ntlmv2`` is set and this is ``None``, a minimal set
+        carrying ``targetName`` (computer + domain) is generated so NTLMv2 clients
+        can build a response.
+    :param signingRequired: advertise SIGN|SEAL|ALWAYS_SIGN|KEY_EXCH, as
+        getNTLMSSPType1() does for ``signingRequired``.
+    :param use_ntlmv2: advertise TARGET_INFO (required for an NTLMv2 response).
+    :param version: a ``VERSION`` (or raw bytes) to embed; sets NEGOTIATE_VERSION.
+    :param flags: an explicit NegotiateFlags value to advertise.  When given it
+        replaces the set derived from ``signingRequired``/``use_ntlmv2`` and is used
+        verbatim (a caller that needs an exact flag word): TARGET_TYPE_SERVER is not
+        inferred from ``targetName``.  NEGOTIATE_VERSION is still added when
+        ``version`` is given (the Version field is otherwise unparseable), and client
+        masking still applies when ``type1`` is supplied.
+    :return: the ``NTLMAuthChallenge``.  Call ``.getData()`` for the wire bytes; the
+        chosen nonce is readable at ``message['challenge']``.
+    """
+    if isinstance(type1, (bytes, bytearray)):
+        negotiate = NTLMAuthNegotiate()
+        negotiate.fromString(bytes(type1))
+        type1 = negotiate
+
+    explicitFlags = flags is not None
+    if flags is None:
+        flags = NTLMSSP_NEGOTIATE_NTLM | NTLMSSP_NEGOTIATE_UNICODE | NTLMSSP_REQUEST_TARGET | \
+                NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY | NTLMSSP_NEGOTIATE_128 | \
+                NTLMSSP_NEGOTIATE_56
+        if use_ntlmv2:
+            flags |= NTLMSSP_NEGOTIATE_TARGET_INFO
+        if signingRequired:
+            flags |= NTLMSSP_NEGOTIATE_SIGN | NTLMSSP_NEGOTIATE_SEAL | \
+                     NTLMSSP_NEGOTIATE_ALWAYS_SIGN | NTLMSSP_NEGOTIATE_KEY_EXCH
+
+    # A server never negotiates a capability the client did not offer in its Type 1.
+    if type1 is not None:
+        for capability in (NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY,
+                           NTLMSSP_NEGOTIATE_KEY_EXCH, NTLMSSP_NEGOTIATE_SEAL,
+                           NTLMSSP_NEGOTIATE_SIGN, NTLMSSP_NEGOTIATE_128,
+                           NTLMSSP_NEGOTIATE_56):
+            if (type1['flags'] & capability) == 0:
+                flags &= 0xffffffff ^ capability
+
+    challengeMessage = NTLMAuthChallenge()
+    if challenge is None:
+        challenge = b("".join([random.choice(string.digits + string.ascii_letters) for _ in range(8)]))
+    challengeMessage['challenge'] = challenge
+
+    versionField = b''
+    if version is not None:
+        flags |= NTLMSSP_NEGOTIATE_VERSION
+        versionField = version.getData() if isinstance(version, VERSION) else bytes(version)
+    challengeMessage['Version'] = versionField
+
+    # An explicit flags= word is advertised verbatim; only in the derived-flags
+    # mode is TARGET_TYPE_SERVER inferred from the presence of a targetName.
+    if targetName != '' and not explicitFlags:
+        flags |= NTLMSSP_TARGET_TYPE_SERVER
+    targetNameBytes = targetName.encode('utf-16le') if targetName else b''
+    challengeMessage['domain_name'] = targetNameBytes
+
+    if targetInfo is None and (flags & NTLMSSP_NEGOTIATE_TARGET_INFO):
+        targetInfo = AV_PAIRS()
+        targetInfo[NTLMSSP_AV_HOSTNAME] = targetInfo[NTLMSSP_AV_DOMAINNAME] = \
+            targetName.encode('utf-16le')
+    if targetInfo is None:
+        targetInfoBytes = b''
+    elif isinstance(targetInfo, (bytes, bytearray)):
+        targetInfoBytes = bytes(targetInfo)
+    else:
+        targetInfoBytes = targetInfo.getData()
+    challengeMessage['TargetInfoFields'] = targetInfoBytes
+
+    challengeMessage['flags'] = flags
+    # The fixed header is 48 bytes; the Version, TargetName and TargetInfo payloads
+    # follow in that order.  NTLMAuthChallenge's default domain_offset (=40) is a
+    # legacy value, so the two offsets are recomputed here when building a message.
+    header_len = 48
+    challengeMessage['domain_offset'] = header_len + len(versionField)
+    challengeMessage['TargetInfoFields_offset'] = \
+        header_len + len(versionField) + len(targetNameBytes)
+    return challengeMessage
+
+
+def verifyNTLMSSPType3(type2, type3, user=None, password='', domain=None,
+                       lmhash='', nthash='', use_ntlmv2=USE_NTLMv2):
+    """Acceptor-side verification of an AUTHENTICATE_MESSAGE (Type 3) against a
+    stored credential -- the server-side counterpart to getNTLMSSPType3().
+
+    Recomputes the NTLMv2 NTProofStr from the client challenge and blob embedded in
+    the Type 3 together with the stored secret, and compares it in constant time to
+    the proof the client sent.  On a match it also derives the session key the
+    server must use for its signing/sealing context: the sessionBaseKey, unwrapped
+    through the EncryptedRandomSessionKey when KEY_EXCH was negotiated.
+
+    :param type2: the CHALLENGE_MESSAGE the server sent, as an ``NTLMAuthChallenge``
+        or its raw bytes (the 8-byte server challenge is read from it).
+    :param type3: the AUTHENTICATE_MESSAGE received from the client, as an
+        ``NTLMAuthChallengeResponse`` or its raw bytes.
+    :param user: the account name; when ``None`` it is read from the Type 3.
+    :param password: the account password (alternative to ``nthash``).
+    :param domain: the account domain; when ``None`` it is read from the Type 3.
+    :param nthash: the account NT hash, as raw bytes or a hex string.
+    :param use_ntlmv2: must be ``True``; NTLMv1 verification is not implemented.
+    :raises ValueError: if the Type 3 asserts a negotiate flag the Type 2 did not
+        offer (a protocol downgrade attempt), distinct from a bad-credential result.
+    :return: ``(authenticated, sessionKey)``.  ``sessionKey`` is ``b''`` on a
+        credential mismatch.
+    """
+    if not use_ntlmv2:
+        raise NotImplementedError("verifyNTLMSSPType3 only supports NTLMv2")
+    import hmac as _hmac
+
+    challenge = type2 if isinstance(type2, NTLMAuthChallenge) else NTLMAuthChallenge(type2)
+    type3 = type3.getData() if isinstance(type3, NTLMAuthChallengeResponse) else bytes(type3)
+
+    def securityBuffer(offset):
+        length, _max, boff = struct.unpack_from('<HHI', type3, offset)
+        return type3[boff:boff + length]
+
+    # A client must not assert a capability the server did not offer in its Type 2
+    # (this blocks a silent downgrade of SIGN/SEAL/etc.).  NEGOTIATE_VERSION only
+    # marks that a Version field is present, so it is excluded from the check.
+    offeredFlags = int(challenge['flags'])
+    assertedFlags = struct.unpack_from('<I', type3, 0x3c)[0]
+    if (assertedFlags & ~offeredFlags) & ~NTLMSSP_NEGOTIATE_VERSION:
+        raise ValueError(
+            "NTLM Type 3 asserts flags (0x%08x) not offered in the Type 2 (0x%08x)"
+            % (assertedFlags, offeredFlags))
+
+    ntResponse = securityBuffer(0x14)                          # NtChallengeResponse
+    if len(ntResponse) < 16:
+        return False, b''
+    ntProofStr, temp = ntResponse[:16], ntResponse[16:]
+
+    if user is None:
+        user = securityBuffer(0x24).decode('utf-16le', 'replace')      # UserName
+    if domain is None:
+        domain = securityBuffer(0x1c).decode('utf-16le', 'replace')    # DomainName
+    if isinstance(nthash, str) and nthash:
+        nthash = binascii.unhexlify(nthash)
+
+    serverChallenge = challenge['challenge']
+    responseKeyNT = NTOWFv2(user, password, domain, nthash)
+    if not _hmac.compare_digest(hmac_md5(responseKeyNT, serverChallenge + temp), ntProofStr):
+        return False, b''
+
+    sessionBaseKey = hmac_md5(responseKeyNT, ntProofStr)
+    encryptedSessionKey = securityBuffer(0x34)                 # EncryptedRandomSessionKey
+    if (assertedFlags & NTLMSSP_NEGOTIATE_KEY_EXCH) and encryptedSessionKey:
+        sessionKey = ARC4.new(sessionBaseKey).decrypt(encryptedSessionKey)
+    else:
+        sessionKey = sessionBaseKey
+    return True, sessionKey
 
 
 # NTLMv1 Algorithm

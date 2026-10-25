@@ -354,6 +354,98 @@ class NTLMTests(unittest.TestCase):
     def test_compute_nthash_accepts_text_and_bytes(self):
         self.assertEqual(ntlm.compute_nthash('Password'), ntlm.compute_nthash(b'Password'))
 
+    def test_getNTLMSSPType2_pack_and_parse(self):
+        # The acceptor-side CHALLENGE builder must round-trip through the parser,
+        # including the TargetName / TargetInfo offsets it computes.
+        ntlm.USE_NTLMv2 = True
+        serverChallenge = b('\x01\x23\x45\x67\x89\xab\xcd\xef')
+        type1 = ntlm.getNTLMSSPType1(self.workstationName, self.domain, signingRequired=True)
+        challenge = ntlm.getNTLMSSPType2(type1, challenge=serverChallenge,
+                                         targetName=self.serverName, signingRequired=True)
+
+        self.assertEqual(challenge['challenge'], serverChallenge)
+        self.assertTrue(challenge['flags'] & ntlm.NTLMSSP_NEGOTIATE_KEY_EXCH)
+        self.assertTrue(challenge['flags'] & ntlm.NTLMSSP_NEGOTIATE_TARGET_INFO)
+
+        parsed = ntlm.NTLMAuthChallenge(challenge.getData())
+        self.assertEqual(parsed['challenge'], serverChallenge)
+        self.assertEqual(parsed['flags'], challenge['flags'])
+        self.assertEqual(parsed['domain_name'], self.serverName.encode('utf-16le'))
+        # TargetInfo must survive the offset round-trip as valid AV pairs.
+        av = ntlm.AV_PAIRS(parsed['TargetInfoFields'])
+        self.assertIn(ntlm.NTLMSSP_AV_HOSTNAME, av)
+
+    def test_getNTLMSSPType2_masks_client_flags(self):
+        # A server must not advertise a capability the client did not offer.
+        type1 = ntlm.getNTLMSSPType1(self.workstationName, self.domain, signingRequired=False)
+        challenge = ntlm.getNTLMSSPType2(type1, targetName=self.serverName, signingRequired=True)
+        self.assertFalse(challenge['flags'] & ntlm.NTLMSSP_NEGOTIATE_SEAL)
+        self.assertFalse(challenge['flags'] & ntlm.NTLMSSP_NEGOTIATE_KEY_EXCH)
+
+    def __ntlm_roundtrip(self, signingRequired, nthash=''):
+        ntlm.USE_NTLMv2 = True
+        type1 = ntlm.getNTLMSSPType1(self.workstationName, self.domain,
+                                     signingRequired=signingRequired)
+        challenge = ntlm.getNTLMSSPType2(type1, targetName=self.serverName,
+                                         signingRequired=signingRequired)
+        type3, clientKey = ntlm.getNTLMSSPType3(
+            type1, challenge.getData(), self.user, '' if nthash else self.password,
+            self.domain, nthash=nthash)
+        return challenge, type3, clientKey
+
+    def test_verifyNTLMSSPType3_roundtrip_password(self):
+        # getNTLMSSPType2 -> getNTLMSSPType3 (client) -> verifyNTLMSSPType3 (server),
+        # with and without KEY_EXCH; the key the server derives must equal the
+        # client's exported session key.
+        for signing in (False, True):
+            challenge, type3, clientKey = self.__ntlm_roundtrip(signing)
+            ok, serverKey = ntlm.verifyNTLMSSPType3(
+                challenge, type3, self.user, password=self.password, domain=self.domain)
+            self.assertTrue(ok)
+            self.assertEqual(serverKey, clientKey)
+
+    def test_verifyNTLMSSPType3_roundtrip_nthash(self):
+        nthash = ntlm.compute_nthash(self.password)
+        challenge, type3, clientKey = self.__ntlm_roundtrip(True, nthash=nthash)
+        ok, serverKey = ntlm.verifyNTLMSSPType3(
+            challenge, type3, self.user, domain=self.domain, nthash=nthash)
+        self.assertTrue(ok)
+        self.assertEqual(serverKey, clientKey)
+        # user/domain may be read from the Type 3 itself when omitted.
+        ok2, _ = ntlm.verifyNTLMSSPType3(challenge, type3, nthash=nthash)
+        self.assertTrue(ok2)
+
+    def test_verifyNTLMSSPType3_rejects_wrong_secret(self):
+        challenge, type3, _ = self.__ntlm_roundtrip(True)
+        ok, serverKey = ntlm.verifyNTLMSSPType3(
+            challenge, type3, self.user, password='WrongPassword', domain=self.domain)
+        self.assertFalse(ok)
+        self.assertEqual(serverKey, b'')
+
+    def test_verifyNTLMSSPType3_rejects_flag_downgrade(self):
+        # A Type 3 that asserts a capability the Type 2 never offered must be
+        # rejected (distinct from a bad credential) to block a silent downgrade.
+        challenge, type3, _ = self.__ntlm_roundtrip(True)
+        raw = bytearray(type3.getData())
+        offered = int(challenge['flags'])
+        asserted = struct.unpack_from('<I', raw, 0x3c)[0]
+        notOffered = (~(offered | ntlm.NTLMSSP_NEGOTIATE_VERSION)) & 0xffffffff
+        bit = notOffered & (-notOffered)                 # lowest un-offered, non-VERSION bit
+        struct.pack_into('<I', raw, 0x3c, asserted | bit)
+        with self.assertRaises(ValueError):
+            ntlm.verifyNTLMSSPType3(challenge, bytes(raw), self.user,
+                                    password=self.password, domain=self.domain)
+
+    def test_getNTLMSSPType2_explicit_flags(self):
+        # An explicit flags= word is advertised verbatim (TARGET_TYPE_SERVER is NOT
+        # inferred from targetName); the signingRequired/use_ntlmv2 defaults are
+        # bypassed.
+        want = (ntlm.NTLMSSP_NEGOTIATE_NTLM | ntlm.NTLMSSP_NEGOTIATE_UNICODE |
+                ntlm.NTLMSSP_NEGOTIATE_TARGET_INFO |
+                ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY)
+        challenge = ntlm.getNTLMSSPType2(targetName=self.serverName, flags=want)
+        self.assertEqual(challenge['flags'], want)
+
     def __pack_and_parse(self, message, expected):
         data = message.getData()
         hexdump(data)
