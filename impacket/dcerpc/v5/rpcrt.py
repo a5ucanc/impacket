@@ -1649,6 +1649,7 @@ class DCERPC_v5(DCERPC):
                                                                                          bindResp['auth_data'])
 
             self.__sequence = 0
+            self.__serverSequence = 0
 
             if self.__auth_level in (RPC_C_AUTHN_LEVEL_CONNECT, RPC_C_AUTHN_LEVEL_PKT_INTEGRITY, RPC_C_AUTHN_LEVEL_PKT_PRIVACY):
                 if self.__auth_type == RPC_C_AUTHN_WINNT:
@@ -1909,15 +1910,20 @@ class DCERPC_v5(DCERPC):
                 if sec_trailer['auth_level'] == RPC_C_AUTHN_LEVEL_PKT_PRIVACY:
                     if self.__auth_type == RPC_C_AUTHN_WINNT:
                         if self.__flags & ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
-                            # TODO: FIX THIS, it's not calculating the signature well
-                            # Since I'm not testing it we don't care... yet
-                            answer, signature =  ntlm.SEAL(self.__flags, 
-                                    self.__serverSigningKey, 
-                                    self.__serverSealingKey,  
-                                    answer, 
-                                    answer, 
-                                    self.__sequence, 
+                            # With NTLM2 only the stub is sealed, but the signature covers the
+                            # whole PDU (header + plaintext stub + sec_trailer) -- the same bytes
+                            # the sender signs as get_packet()[:-16]. Decrypt the stub, rebuild
+                            # that PDU, then verify the MAC using the inbound (server) sequence.
+                            answer = self.__serverSealingHandle(answer)
+                            signedPDU = response_data[:off] + answer + auth_data[:len(sec_trailer)]
+                            signature = ntlm.SIGN(self.__flags,
+                                    self.__serverSigningKey,
+                                    signedPDU,
+                                    self.__serverSequence,
                                     self.__serverSealingHandle)
+                            if signature.getData() != auth_data[len(sec_trailer):]:
+                                raise DCERPCException("NTLM2 sealed response signature verification failed")
+                            self.__serverSequence += 1
                         else:
                             answer, signature = ntlm.SEAL(self.__flags, 
                                     self.__serverSigningKey, 
@@ -1943,11 +1949,17 @@ class DCERPC_v5(DCERPC):
                     if self.__auth_type == RPC_C_AUTHN_WINNT:
                         ntlmssp = auth_data[12:]
                         if self.__flags & ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
-                            signature =  ntlm.SIGN(self.__flags, 
-                                    self.__serverSigningKey, 
-                                    answer, 
-                                    self.__sequence, 
+                            # NTLM2 signs the whole PDU (header + stub + sec_trailer), not just
+                            # the stub; verify over that using the inbound (server) sequence.
+                            signedPDU = response_data[:off] + answer + auth_data[:len(sec_trailer)]
+                            signature = ntlm.SIGN(self.__flags,
+                                    self.__serverSigningKey,
+                                    signedPDU,
+                                    self.__serverSequence,
                                     self.__serverSealingHandle)
+                            if signature.getData() != auth_data[len(sec_trailer):]:
+                                raise DCERPCException("NTLM2 signed response signature verification failed")
+                            self.__serverSequence += 1
                         else:
                             signature = ntlm.SIGN(self.__flags, 
                                     self.__serverSigningKey, 
